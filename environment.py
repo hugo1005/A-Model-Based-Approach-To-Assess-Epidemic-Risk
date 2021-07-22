@@ -1,49 +1,76 @@
-import matplotlib.pyplot as plt
-import tqdm
+import math
 import numpy as np
 import pandas as pd
 import random
+from tqdm import tqdm, trange
+import matplotlib.pyplot as plt
 from collections import namedtuple
+import pickle
+import seaborn as sns
 
-"""MIT License
 
-Copyright (c) [2020] [Hugo Dolan]
+adj_matrix = pd.read_csv('./outputs/airport_routes_matrix.csv',index_col=0)
+alphas = pd.read_csv('./outputs/airport_alphas.csv', index_col=0)
+centralities = pd.read_csv('./outputs/airport_centralities.csv', index_col=0)
+populations = pd.read_csv('./outputs/airport_populations.csv', index_col=0)
+communities = pd.read_csv('./outputs/bsm_communities.csv', index_col=0).set_index('IATA').reindex(adj_matrix.columns)
+airports = pd.read_csv('./outputs/airports_w_populations.csv',index_col=0)
+airport_country = pd.read_csv('./outputs/airport_country_mapping.csv', index_col=0).set_index('IATA').reindex(adj_matrix.columns)
+betweeness = pd.read_csv('./outputs/airport_betweeness.csv', index_col=0).reindex(adj_matrix.columns)
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+LHR = 147 # London Heathrow
+ATL = 2880 # Atlanta
+DXB = 3199 # Dubai
+WUH = 724 # Wuhan Airport
+JFK = 3097 # JFK New York
+HKG = 1197 # Hong Kong
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+vals = lambda X: X.values
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE."""
+def get_community(airport_idx):
+    community_id = communities['community'][airport_idx]
+    return communities.reset_index()[communities.reset_index()['community'] == community_id].index.values
+
+def close_airport_pct(threshold_above, metric=populations):
+    threshold = metric.quantile(q=threshold_above)[0]
+    return (metric > threshold).values.reshape(-1)
 
 ActionSpace = namedtuple('ActionSpace', ['n','sample'])
 ObservationSpace = namedtuple('ObservationSpace', ['n'])
 
+countries = airport_country['country_IATA'].unique()
+dimension = len(airport_country['country_IATA'].unique())
+
 class EpidemicEnvironment:
-    def __init__(self, adj_matrix, population_vector, agent_idx, community, infected_idx = 0,
-                 alpha_plus = 0.3, alphas_plus = None, c_plus = 0.1,
-                 c_minus = 1, beta = 57/160 + 1/7, beta_reduced = 25/160 + 1/7, gamma = 1/16, delta = 1/(2*365), 
-                 epsilon = 1/7, centrality = None,p=1, lmbda = 1.2, mu = 0.2, lockdown_threshold = -1):
+    def __init__(self, adj_matrix, 
+                 population_vector, 
+                 agent_idx, 
+                 community, 
+                 infected_idx = 0,
+                 alpha_plus = 0.3, 
+                 alphas_plus = None, 
+                 c_plus = 0.1,
+                 c_minus = 1, 
+                 beta = 57/160 + 1/7, 
+                 beta_reduced = 25/160 + 1/7, 
+                 gamma = 1/16, 
+                 delta = 1/(2*365), 
+                 epsilon = 1/7, 
+                 centrality = None,
+                 p = 1, 
+                 lmbda = 1.2, 
+                 mu = 0.2, 
+                 lockdown_threshold = -1, 
+                 decay = 0):
         """
         SEIRS Network Epidemic Model Environment
-        - Currently designed only for a single agent! 
         :param adj_matrix: Adjacency Matrix (A)ij indicates edge from i to j (NxN)
         :param population_vector: Nx1 Vector of populations for each node
         :param agent_idx: Airport index associated with the agent
         :param community: A list of airport indexes of airports in the same community
+        :param infected_idx: airport where the epidemic starts
         :param alpha_plus: Percentage of base population which can fly 
-        :param alpha_plus: Percentage of base population which can fly (Specifed as an Nx1 vector)
+        :param alphas_plus: Percentage of base population which can fly (Specifed as an Nx1 vector)
         :param c_plus: Percentage of flying population who can embark on any day
         :param c_minus: Percentage of flying population who can return on any day
         :param beta: Rate of infection
@@ -55,6 +82,7 @@ class EpidemicEnvironment:
         :param lmbda: rate at which penalty for infections in unmitigated state should be applied > 1
         :param mu: rate at which penalty for infections in lockdown state should be applied < 1
         :param lockdown_threshold: within (0,1) defining pct of population in any node which can get infected before a lockdown
+        :param decay: non-negative number defining the decay rate of the beta parameter over time, value 0 means no decay
         """
         
         # Initialisation
@@ -66,6 +94,13 @@ class EpidemicEnvironment:
         self.agent_idx = agent_idx
         self.c_plus = c_plus
         self.c_minus = c_minus
+        self.decay = decay
+        self.beta = beta
+        self.beta_reduced = beta_reduced
+        self.epsilon = epsilon
+        self.gamma = gamma
+        self.delta = delta
+        self.decay = decay
         
         if type(alphas_plus) == type(None):
             self.alphas_plus = np.diag(np.repeat(alpha_plus,self.N)) # Airport Vector proportion of populations
@@ -117,6 +152,11 @@ class EpidemicEnvironment:
         self.lockdown_threshold = lockdown_threshold
         
     def reset(self):
+        # Reset the matrix B because it might have changed due to exponential decay
+        self.B = np.array([[-1*self.beta, 0, 0, self.delta],[self.beta, -1*self.epsilon, 0,0],[0,self.epsilon, -1*self.gamma, 0],[0, 0, self.gamma, -1*self.delta]])
+        self.B_reduced = np.array([[-1*self.beta_reduced, 0, 0, self.delta],[self.beta_reduced, -1*self.epsilon, 0,0],[0,self.epsilon, -1*self.gamma, 0],[0, 0, self.gamma, -1*self.delta]])
+        self.B_zero = np.array([[-1*0, 0, 0, self.delta],[0, -1*self.epsilon, 0,0],[0,self.epsilon, -1*self.gamma, 0],[0, 0, self.gamma, -1*self.delta]])
+
         # For most populations in the network they will start disease free
         s_init, e_init, i_init, r_init = 1, 0, 0, 0
 
@@ -244,7 +284,7 @@ class EpidemicEnvironment:
 
         return y
     
-    def step(self, action, disable_travel=False):
+    def step(self, action, disable_travel = False):
         """
         WARNING: Action is no longer implemented
         :param action: 0 = Open; 1 = Lockdown -> leads to beta_reduced being utilised for the agents airport & No travel in or out permitted
@@ -252,6 +292,14 @@ class EpidemicEnvironment:
         :param disable_airports: Disable all travel for selected airports (N Binary Vector)
         :return: (State, Reward)
         """
+        
+        # reduce beta parameter based on how many days have passed
+        scaling_factor = math.exp(-self.decay/365)
+        self.B[0,0] *= scaling_factor
+        self.B[1,0] *= scaling_factor
+        self.B_reduced[0,0] *= scaling_factor
+        self.B_reduced[1,0] *= scaling_factor
+        
         # Populations
         thetas = self.thetas_B + self.thetas_T
         thetas_B_populations = self.thetas_B.sum(axis=0)
@@ -291,7 +339,15 @@ class EpidemicEnvironment:
         thetas_T_star = thetas_T_ratio * thetas_star
 
         # Travelling populations
-        omegas_plus_star = thetas_B_star @ self.alphas_plus # Departures
+#         omegas_plus_star = thetas_B_star @ self.alphas_plus # Departures
+        omegas_plus_star = np.copy(thetas_B_star)
+        for c in range(4):
+            if c != 2:
+                for i in range(self.N):
+                    omegas_plus_star[c,i] *= self.alphas_plus[i,i] # Departures, ensuring that infected are not allowed to travel
+            else:
+                for i in range(self.N):
+                    omegas_plus_star[c,i] *= 0
         omegas_minus_star = thetas_T_star # Arrivals (we got rid of alpha minus as it is redundant)
 
         # International Spread / Diffusion (1/D prevents simultaneous changes exceeding the supply)
@@ -378,3 +434,69 @@ class EpidemicEnvironment:
         current_state = self.state_to_idx(np.array([discrete_state_local, discrete_state_community, discrete_state_global]))
         
         return current_state, reward
+
+
+def fitness_function_gen(n_days):
+    def fitness_function(X):
+        # 1. Compute the peak infections and total recoveries
+        gamma = 1/25
+        beta = 3
+        decay = 5
+        eps = 1/7
+        n_iters = 200
+        country_to_disable = np.array(X, dtype=np.bool_)
+
+        mapping = airport_country.reset_index()
+        mapping.columns = ['IATA', 'country_IATA']
+
+        # Airports
+        to_disable = mapping['country_IATA'].isin(list(countries[country_to_disable])).values
+
+        # As calculated during previous simulation
+        max_peak_infections = 2885487730.5877514
+        max_total_infections = 7138688697.766091
+
+        env = EpidemicEnvironment(vals(adj_matrix), 
+                                  vals(populations), 
+                                  ATL, 
+                                  get_community(ATL), 
+                                  infected_idx = WUH, 
+                                  alphas_plus = vals(alphas),
+                                  lmbda = 10, 
+                                  mu = 0.2, 
+                                  centrality = centralities.values, 
+                                  gamma = gamma, 
+                                  beta = beta, 
+                                  epsilon = eps, 
+                                  beta_reduced = beta,
+                                  decay = decay)
+
+        env.reset()
+
+        for i in range(n_days):
+            env.step(0)
+
+        env.set_disabled_airports(to_disable)
+
+        for i in range(n_iters - n_days):
+            env.step(0)
+
+        infections = env.stateHistory[:,2,:].sum(axis=1)
+        recoveries = env.stateHistory[:,3,:].sum(axis=1)
+        population = env.stateHistory[0,:,:].sum()
+
+        peak_infections = infections.max()
+        total_infections = recoveries.max()
+
+        reduced_pct_infections = (1 - (infections.max() / max_peak_infections))
+        reduced_pct_recoveries = (1 - (recoveries.max() / max_total_infections)) 
+        pct_nodes_enabled = (1 - (to_disable.sum() / to_disable.shape[0])) 
+
+        # Preference towards higher number of nodes
+        fitness = reduced_pct_recoveries * reduced_pct_infections * np.sin(0.5 * np.pi * pct_nodes_enabled)
+        minimise = 1 - fitness
+
+        return minimise
+    return fitness_function
+
+
